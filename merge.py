@@ -633,7 +633,7 @@ def restore_headers(root, state):
             if not text:
                 continue
             # The template's own heading just above the box already says it
-            if i == 0 and above and label(above) == label(text):
+            if above and label(above) == label(text):
                 continue
             prev = pl["node"].find_previous_sibling()
             if prev is not None and label(prev.get_text()) == label(text):
@@ -791,6 +791,11 @@ def merge_template(raw_html, cfg):
         state["order"] = r["__order"]
         state["label"] = r.get("label") or ""
         target = find_label(root, r.get("names") or [])
+        # A heading already filled by an earlier section is spoken for. A second
+        # section pointing at it joins that box below, in doc order, instead of
+        # overwriting what is already there.
+        if target is not None and any(target is u for u in used_targets):
+            target = None
         if target is not None and not r.get("inline"):
             count = replace_under(target, r["html"], root, section_labels, state)
             if count >= 0:
@@ -1030,8 +1035,49 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
     if not (prompt or objective or instructions or banner):
         instructions = content_html
 
+    # Route definitions, so a doc section can be turned into a region whichever
+    # parser it came from.
+    route_cfg = {
+        "prompt": {
+            "key": "Discussion Prompt",
+            "names": ["Discussion Prompt", "Prompt", "Scenario", "Overview",
+                      "Background", "Case Study"],
+            "brackets": ["prompt", "scenario", "overview", "background"],
+        },
+        "objective": {
+            "key": "Objective",
+            "names": ["Objective", "Objectives", "Purpose"],
+            "brackets": ["objective", "purpose"],
+        },
+        "instructions": {
+            "key": "Instructions",
+            "names": [n for n in [anchor, "Discussion Instructions", "Instructions",
+                                  "Directions", "Questions", "Task", "Requirements"] if n],
+            "brackets": ["requirement", "instruction", "question",
+                         "insert instructions"],
+        },
+    }
+
     regions = []
-    if prompt:
+    # Each section of the doc is its own region, so two that route to the same
+    # place keep their own headers and their own spot in the reading order.
+    for ch in (sections.get("_chunks") or []):
+        base = route_cfg.get(ch.get("route"))
+        html = (ch.get("html") or "").strip()
+        if not base or not html:
+            continue
+        shown = (ch.get("label") or "").strip()
+        names = ([shown.rstrip(":").strip()] if shown else []) + base["names"]
+        regions.append({
+            "key": shown or base["key"],
+            "names": names,
+            "brackets": base["brackets"],
+            "html": html,
+            "order": ch.get("order", 0),
+            "label": shown,
+        })
+
+    if not sections.get("_chunks") and prompt:
         regions.append({
             "key": "Discussion Prompt",
             "names": ["Discussion Prompt", "Prompt", "Scenario", "Overview",
@@ -1041,7 +1087,7 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
             "order": _ord("prompt", 0),
             "label": label_map.get("prompt", ""),
         })
-    if objective:
+    if not sections.get("_chunks") and objective:
         regions.append({
             "key": "Objective",
             "names": ["Objective", "Objectives", "Purpose"],
@@ -1050,7 +1096,7 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
             "order": _ord("objective", 1),
             "label": label_map.get("objective", ""),
         })
-    if instructions:
+    if not sections.get("_chunks") and instructions:
         names = [n for n in [anchor, "Discussion Instructions", "Instructions",
                              "Directions", "Questions", "Task", "Requirements"] if n]
         regions.append({

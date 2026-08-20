@@ -353,12 +353,20 @@ def parse_discussion_docx(path):
     # its headers missing.
     order = {}
     labels = {}
+    # Two sections of the doc can route to the same region, so each one is also
+    # kept on its own; joining them would lose the later header and its place.
+    chunks = []
 
     def _mark(key, idx, shown=""):
         if key not in order:
             order[key] = idx
             if shown:
                 labels[key] = shown
+
+    def _chunk(route, idx, shown, items):
+        if items:
+            chunks.append({"route": route, "order": idx, "label": shown or "",
+                           "items": items})
 
     for gi, (label, its) in enumerate(groups):
         shown = (label or "").strip()
@@ -370,19 +378,24 @@ def parse_discussion_docx(path):
         elif key in _OVERVIEW_LABELS:
             prompt_items.extend(its)
             _mark("prompt", gi, shown)
+            _chunk("prompt", gi, shown, its)
         elif key in _INSTRUCTION_LABELS:
             instruction_items.extend(its)
             _mark("instructions", gi, shown)
+            _chunk("instructions", gi, shown, its)
         elif key in _OBJECTIVE_LABELS and its:
             if objective_item is None:
                 objective_item = its[0]
                 _mark("objective", gi, shown)
+                _chunk("objective", gi, shown, its[:1])
             else:
                 instruction_items.extend(its[:1])
                 _mark("instructions", gi, shown)
+                _chunk("instructions", gi, shown, its[:1])
             instruction_items.extend(its[1:])
             if len(its) > 1:
                 _mark("instructions", gi, shown)
+                _chunk("instructions", gi, shown, its[1:])
         else:
             extras.append({"label": raw, "keyword": key, "bracket": bracketed,
                            "items": its, "order": gi, "display": shown})
@@ -409,21 +422,27 @@ def parse_discussion_docx(path):
             prompt_items = loose
             if loose_order is not None:
                 order["prompt"] = loose_order
+            _chunk("prompt", loose_order or 0, "", loose)
         elif not instruction_items:
             instruction_items = loose
             if loose_order is not None:
                 order["instructions"] = loose_order
+            _chunk("instructions", loose_order or 0, "", loose)
         else:
             instruction_items = loose + instruction_items
             if loose_order is not None:
                 order["instructions"] = min(loose_order,
                                             order.get("instructions", loose_order))
+            _chunk("instructions", loose_order or 0, "", loose)
 
     sections = {
         "_week": week_num,
         "_topic": topic or title,
         "_order": order,
         "_labels": labels,
+        "_chunks": [{"route": c["route"], "order": c["order"],
+                     "label": c["label"], "html": _render_items(c["items"])}
+                    for c in sorted(chunks, key=lambda c: c["order"])],
         "_regions": [{"label": e["label"], "keyword": e["keyword"],
                       "bracket": e["bracket"], "order": e["order"],
                       "display": e.get("display") or e["label"],
@@ -819,12 +838,21 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
 
     order = {}
     labels = {}
+    # Two sections can route to the same region ("Instructions" for an
+    # unlabelled opener and again for "Discussion Questions"). Joining them into
+    # one blob loses the second one's header and makes both inherit the first
+    # one's place in the doc, so each section is also kept on its own here.
+    chunks = []
 
     def _mark(key, idx, shown=""):
         if key not in order:
             order[key] = idx
             if shown:
                 labels[key] = shown
+
+    def _chunk(route, idx, shown, html):
+        chunks.append({"route": route, "order": idx,
+                       "label": shown or "", "html": html})
 
     for _pi, (header, content) in enumerate(pairs):
         shown = (header or "").strip()
@@ -843,12 +871,15 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
         if route == "prompt":
             prompt.append(html)
             _mark("prompt", _pi, shown)
+            _chunk("prompt", _pi, shown, html)
         elif route == "objective":
             objective.append(html)
             _mark("objective", _pi, shown)
+            _chunk("objective", _pi, shown, html)
         elif route == "instructions":
             instructions.append(html)
             _mark("instructions", _pi, shown)
+            _chunk("instructions", _pi, shown, html)
         elif route == "template":
             extras.append({"label": raw, "keyword": _norm_label(raw),
                            "bracket": raw.startswith("[") and raw.endswith("]"),
@@ -870,6 +901,8 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
                     f"{banner_heading_html(template_html, raw)}\n{html}"
                 )
                 _mark("instructions", _pi, shown)
+                _chunk("instructions", _pi, shown,
+                       f"{banner_heading_html(template_html, raw)}\n{html}")
         else:
             extras.append({"label": raw, "keyword": _norm_label(raw),
                            "bracket": raw.startswith("[") and raw.endswith("]"),
@@ -885,6 +918,7 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
         "_topic": resolved_title,
         "_order": order,
         "_labels": labels,
+        "_chunks": chunks,
         "_regions": extras,
         "_typed": True,
         "_unmatched": unmatched,
