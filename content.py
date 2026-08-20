@@ -339,7 +339,7 @@ def parse_discussion_docx(path):
     for it in body:
         if _is_section_label(it):
             groups.append((current, bucket))
-            current, bucket = it["text"].strip().rstrip(":"), []
+            current, bucket = it["text"].strip(), []
             continue
         bucket.append(it)
     groups.append((current, bucket))
@@ -347,22 +347,48 @@ def parse_discussion_docx(path):
 
     prompt_items, instruction_items, objective_item, loose = [], [], None, []
     extras = []
-    for label, its in groups:
+    # Where each section sat in the doc, and the header the doc gave it. The
+    # merge fills whichever section the template names first, so without this
+    # the rest get added after it and the finished box reads out of order with
+    # its headers missing.
+    order = {}
+    labels = {}
+
+    def _mark(key, idx, shown=""):
+        if key not in order:
+            order[key] = idx
+            if shown:
+                labels[key] = shown
+
+    for gi, (label, its) in enumerate(groups):
+        shown = (label or "").strip()
         raw = (label or "").strip().rstrip(":")
         bracketed = raw.startswith("[") and raw.endswith("]")
         key = (raw[1:-1] if bracketed else raw).strip().lower()
         if label is None:
-            loose.extend(its)
+            loose.append((gi, its))
         elif key in _OVERVIEW_LABELS:
             prompt_items.extend(its)
+            _mark("prompt", gi, shown)
         elif key in _INSTRUCTION_LABELS:
             instruction_items.extend(its)
+            _mark("instructions", gi, shown)
         elif key in _OBJECTIVE_LABELS and its:
-            objective_item = objective_item or its[0]
+            if objective_item is None:
+                objective_item = its[0]
+                _mark("objective", gi, shown)
+            else:
+                instruction_items.extend(its[:1])
+                _mark("instructions", gi, shown)
             instruction_items.extend(its[1:])
+            if len(its) > 1:
+                _mark("instructions", gi, shown)
         else:
-            extras.append({"label": raw, "keyword": key,
-                           "bracket": bracketed, "items": its})
+            extras.append({"label": raw, "keyword": key, "bracket": bracketed,
+                           "items": its, "order": gi, "display": shown})
+
+    loose_order = loose[0][0] if loose else None
+    loose = [it for _gi, its in loose for it in its]
 
     if objective_item is None:
         for pool in (loose, instruction_items, prompt_items):
@@ -381,16 +407,27 @@ def parse_discussion_docx(path):
     if loose:
         if not prompt_items and not instruction_items:
             prompt_items = loose
+            if loose_order is not None:
+                order["prompt"] = loose_order
         elif not instruction_items:
             instruction_items = loose
+            if loose_order is not None:
+                order["instructions"] = loose_order
         else:
             instruction_items = loose + instruction_items
+            if loose_order is not None:
+                order["instructions"] = min(loose_order,
+                                            order.get("instructions", loose_order))
 
     sections = {
         "_week": week_num,
         "_topic": topic or title,
+        "_order": order,
+        "_labels": labels,
         "_regions": [{"label": e["label"], "keyword": e["keyword"],
-                      "bracket": e["bracket"], "html": _render_items(e["items"])}
+                      "bracket": e["bracket"], "order": e["order"],
+                      "display": e.get("display") or e["label"],
+                      "html": _render_items(e["items"])}
                      for e in extras],
         "prompt": _render_items(prompt_items),
         "objective": _render_items([objective_item]) if objective_item else "",
@@ -780,7 +817,17 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
                 banner_taken = True
                 break
 
-    for header, content in pairs:
+    order = {}
+    labels = {}
+
+    def _mark(key, idx, shown=""):
+        if key not in order:
+            order[key] = idx
+            if shown:
+                labels[key] = shown
+
+    for _pi, (header, content) in enumerate(pairs):
+        shown = (header or "").strip()
         raw = (header or "").strip().rstrip(":")
         html = _text_to_html(content)
         route, _match = classify_header(raw, template_html)
@@ -795,21 +842,26 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
 
         if route == "prompt":
             prompt.append(html)
+            _mark("prompt", _pi, shown)
         elif route == "objective":
             objective.append(html)
+            _mark("objective", _pi, shown)
         elif route == "instructions":
             instructions.append(html)
+            _mark("instructions", _pi, shown)
         elif route == "template":
             extras.append({"label": raw, "keyword": _norm_label(raw),
                            "bracket": raw.startswith("[") and raw.endswith("]"),
-                           "html": html})
+                           "order": _pi, "display": shown, "html": html})
         elif fold_unmatched:
             # Nothing in the template is named this. The first such header takes
             # over the template's banner: its text becomes the banner heading and
             # its content replaces the placeholder line underneath, so it comes
             # out white-on-red like the rest of the banner.
             if banner is None and not banner_taken:
-                banner = {"label": raw.strip("[]").strip(), "html": html}
+                banner = {"label": raw.strip("[]").strip(), "html": html,
+                          "order": _pi}
+                _mark("_banner", _pi)
             else:
                 # Later ones cannot share the one banner, so they get a copy of
                 # it built inline instead of a bare, unstyled heading.
@@ -817,10 +869,11 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
                 instructions.append(
                     f"{banner_heading_html(template_html, raw)}\n{html}"
                 )
+                _mark("instructions", _pi, shown)
         else:
             extras.append({"label": raw, "keyword": _norm_label(raw),
                            "bracket": raw.startswith("[") and raw.endswith("]"),
-                           "html": html})
+                           "order": _pi, "display": shown, "html": html})
 
     week = None
     m = _re.search(r"week\s*#?\s*(\d+)", resolved_title, _re.I)
@@ -830,6 +883,8 @@ def sections_from_pairs(pairs, title: str = "", template_html: str = "",
     sections = {
         "_week": week,
         "_topic": resolved_title,
+        "_order": order,
+        "_labels": labels,
         "_regions": extras,
         "_typed": True,
         "_unmatched": unmatched,

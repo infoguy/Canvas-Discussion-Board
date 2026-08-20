@@ -318,6 +318,63 @@ def section_after(target):
     return out
 
 
+def top_ancestor(el, root):
+    cur = el
+    while cur is not None and cur.parent is not None and cur.parent is not root:
+        cur = cur.parent
+    return cur
+
+
+def holds_heading_up_to(el, lvl):
+    if is_heading(el) and level(el) <= lvl:
+        return True
+    if isinstance(el, Tag):
+        return any(level(h) <= lvl for h in el.find_all(HEADINGS))
+    return False
+
+
+def holds_section_label(el, section_labels):
+    """
+    A row that opens with a section label of its own ("Instructions", "Helpful
+    Tips") belongs to that section, not to the heading above it, even when the
+    label is a bold line rather than a real heading tag.
+    """
+    if not isinstance(el, Tag):
+        return False
+    cands = [el] + el.find_all(["p", "li", "td", "strong", "b", "span"])
+    for c in cands:
+        if not 0 < words(c.get_text()) <= 6:
+            continue
+        t = label(c.get_text())
+        if any(t == label(s) for s in section_labels):
+            return True
+    return False
+
+
+def wide_section_after(target, root, section_labels):
+    """
+    Loree layouts wrap the heading in one row <div> and the content box that
+    belongs to it in the NEXT row, so the box is not a sibling of the heading at
+    all. When the heading's own siblings hold no filler, widen the search to the
+    rows that follow the heading's row and stop at the next heading of the same
+    or higher rank.
+    """
+    lvl = level(target)
+    top = top_ancestor(target, root)
+    if top is None:
+        return []
+    out = []
+    for n in top.next_siblings:
+        if not isinstance(n, Tag):
+            continue
+        if holds_heading_up_to(n, lvl):
+            break
+        if holds_section_label(n, section_labels):
+            break
+        out.append(n)
+    return out
+
+
 def fillers_in(scope):
     out = []
     for el in scope:
@@ -353,57 +410,238 @@ def insert_point(el, box):
     return cur
 
 
-def filler_fill(target, html, root):
-    fillers = fillers_in(section_after(target))
-    if not fillers:
-        return -1
-
-    # The one container that holds every filler line. Wiping it keeps the box's
-    # own background and borders while its sample content goes.
-    box = fillers[0].parent
+def box_of(fillers):
+    """The single container that holds every filler line handed to it."""
+    box = fillers[0].parent if fillers else None
     for f in fillers[1:]:
         while box is not None and not _contains(box, f):
             box = box.parent
+    return box
 
-    wipe = False
-    if box is not None and box is not root and not _contains(box, target) and box is not target:
-        leaves = leaf_blocks(box)
-        # Only wipe a box that is mostly sample content, never one where the
-        # filler is a minor part of real template copy.
-        if leaves and len(fillers) * 2 >= len(leaves):
-            wipe = True
 
-    if wipe:
-        frag = _wrap(html)
-        _style_frag(frag, _donors_from(_child_tags(box)))
+def mostly_filler(box, fillers, root, target=None):
+    """
+    Only wipe a box that is mostly sample content, never one where the filler
+    is a minor part of real template copy.
+    """
+    if box is None or box is root:
+        return False
+    if target is not None and (_contains(box, target) or box is target):
+        return False
+    leaves = leaf_blocks(box)
+    return bool(leaves and len(fillers) * 2 >= len(leaves))
+
+
+def box_donors(box, state):
+    """
+    The template's own list and paragraph styling, remembered from the sample
+    content the first time a box is emptied. Without this a section added after
+    the wipe has no white type or bullet styling left to copy.
+    """
+    live = _donors_from(_child_tags(box))
+    saved = None
+    for entry in state.get("donors", []):
+        if entry["box"] is box:
+            saved = entry["donors"]
+            break
+    if saved:
+        for tag in ("p", "li", "ul", "ol"):
+            live[tag] = live[tag] or saved[tag]
+    return live
+
+
+def wipe_into(box, html, state):
+    donors = box_donors(box, state)
+    if not any(e["box"] is box for e in state.setdefault("donors", [])):
+        state["donors"].append({"box": box, "donors": donors})
+    frag = _wrap(html)
+    _style_frag(frag, donors)
+    box.clear()
+    return _move_into(frag, parent=box)
+
+
+def put_into(box, html, before, state):
+    """Add a section to a box that already has content, keeping its colours."""
+    frag = _wrap(html)
+    _style_frag(frag, box_donors(box, state))
+    if before is not None and before.parent is box:
+        return _move_into(frag, insert_before=before)
+    return _move_into(frag, parent=box)
+
+
+def header_line(box, text, state):
+    """A bold header line in the box's own type."""
+    donors = box_donors(box, state)
+    soup = BeautifulSoup("<p><strong></strong></p>", "html.parser")
+    p = soup.find("p")
+    _apply_attrs(p, donors.get("p"))
+    p.find("strong").append(NavigableString(text))
+    p.extract()
+    return p
+
+
+def record_placement(state, box, node):
+    if box is None:
+        return
+    if node is not None:
+        state["placements"].append({"box": box, "node": node,
+                                    "order": state["order"],
+                                    "label": state["label"]})
+    state["last_box"] = box
+
+
+def anchor_in(state, box):
+    """
+    The earliest thing already in this box that the doc puts AFTER the section
+    being placed now. New content goes in front of it.
+    """
+    best = None
+    for pl in state["placements"]:
+        if pl["box"] is not box or pl["order"] <= state["order"]:
+            continue
+        if pl["node"] is None or pl["node"].parent is not box:
+            continue
+        if best is None or pl["order"] < best["order"]:
+            best = pl
+    return best["node"] if best else None
+
+
+def filler_fill(target, html, root, state, section_labels):
+    fillers = fillers_in(section_after(target))
+    # Loree layouts keep the heading in one row and its box in the next, so a
+    # sibling-only search finds nothing and the content used to be dropped loose
+    # under the heading with the coloured box left full of Lorem Ipsum.
+    if not fillers:
+        fillers = fillers_in(wide_section_after(target, root, section_labels))
+    if not fillers:
+        return -1
+
+    box = box_of(fillers)
+
+    if mostly_filler(box, fillers, root, target):
         # When the filler was a sample bullet list and the new content is not
         # all bullets, the list wrapper goes with it. Filling it instead would
         # leave paragraphs sitting inside a <ul>, which Canvas then mangles.
+        frag = _wrap(html)
+        _style_frag(frag, box_donors(box, state))
         incoming = [c for c in frag.children if getattr(c, "name", None)]
         if (box.name or "").lower() in {"ul", "ol"} and box.parent is not None \
                 and not all((c.name or "").lower() == "li" for c in incoming):
-            _move_into(frag, insert_before=box)
+            host = box.parent
+            moved = _move_into(frag, insert_before=box)
             box.extract()
+            record_placement(state, host, moved[0] if moved else None)
             return len(fillers)
-        box.clear()
-        _move_into(frag, parent=box)
+        moved = wipe_into(box, html, state)
+        record_placement(state, box, moved[0] if moved else None)
         return len(fillers)
 
     anchor = insert_point(fillers[0], box or root)
     if anchor is None or anchor.parent is None:
         return -1
+    host = anchor.parent
     frag = _wrap(html)
     _style_frag(frag, _donors_from(fillers))
-    _move_into(frag, insert_before=anchor)
+    moved = _move_into(frag, insert_before=anchor)
     for f in fillers:
         fp = f.parent
         if fp is not None:
             f.extract()
             prune_empty(fp, root)
+    landed = box if (box is not None and box is not root) else host
+    record_placement(state, landed, moved[0] if moved else None)
     return len(fillers)
 
 
-def replace_under(target, html, root, section_labels):
+def place_loose(html, root, state, section_labels):
+    """
+    A section the template has no heading and no [ ] spot for still belongs
+    inside the layout: it joins the box the section before it filled, or takes
+    over whatever sample box is still untouched. Appending to the bottom of the
+    page is the last resort, never the first move.
+    """
+    box = state.get("last_box")
+    if box is not None and box.parent is not None:
+        moved = put_into(box, html, anchor_in(state, box), state)
+        record_placement(state, box, moved[0] if moved else None)
+        return "box"
+    fillers = fillers_in([root])
+    if not fillers:
+        return None
+    box = box_of(fillers)
+    if not mostly_filler(box, fillers, root):
+        return None
+    moved = wipe_into(box, html, state)
+    record_placement(state, box, moved[0] if moved else None)
+    return "free"
+
+
+def heading_before(root, box):
+    """The nearest heading that comes before this box in the page."""
+    best = ""
+    for h in _headings(root):
+        if h is box or _contains(h, box):
+            continue
+        if _precedes(h, box, root):
+            best = h.get_text()
+    return best
+
+
+def _doc_index(root, node):
+    """Position of a node in document order, for before/after comparisons."""
+    for i, el in enumerate(root.descendants):
+        if el is node:
+            return i
+    return -1
+
+
+def _precedes(a, b, root):
+    ia, ib = _doc_index(root, a), _doc_index(root, b)
+    return ia >= 0 and ib >= 0 and ia < ib
+
+
+def restore_headers(root, state):
+    """
+    The header the doc gave each section. A section at the top of a box needs
+    none when the template's own heading right above the box already says it;
+    every other section gets its header back, which is how the Word doc reads.
+    """
+    groups = []
+    for pl in state["placements"]:
+        if pl["node"] is None or pl["node"].parent is not pl["box"]:
+            continue
+        slot = next((g for g in groups if g["box"] is pl["box"]), None)
+        if slot is None:
+            slot = {"box": pl["box"], "list": []}
+            groups.append(slot)
+        slot["list"].append(pl)
+
+    for g in groups:
+        box, items = g["box"], g["list"]
+        kids = list(box.children)
+
+        def pos(pl):
+            for i, k in enumerate(kids):
+                if k is pl["node"]:
+                    return i
+            return len(kids)
+
+        items.sort(key=pos)
+        above = heading_before(root, box)
+        for i, pl in enumerate(items):
+            text = (pl.get("label") or "").strip()
+            if not text:
+                continue
+            # The template's own heading just above the box already says it
+            if i == 0 and above and label(above) == label(text):
+                continue
+            prev = pl["node"].find_previous_sibling()
+            if prev is not None and label(prev.get_text()) == label(text):
+                continue
+            pl["node"].insert_before(header_line(box, text, state))
+
+
+def replace_under(target, html, root, section_labels, state):
     """
     Swap everything between a heading and the next section boundary. Sibling
     walking keeps this inside the heading's own container, so a heading that
@@ -413,7 +651,7 @@ def replace_under(target, html, root, section_labels):
         return -1
     # Fill the template's own placeholder first; the sibling sweep below is the
     # fallback for templates that ship no filler at all.
-    by_filler = filler_fill(target, html, root)
+    by_filler = filler_fill(target, html, root, state, section_labels)
     if by_filler >= 0:
         return by_filler
 
@@ -429,11 +667,12 @@ def replace_under(target, html, root, section_labels):
     frag = _wrap(html)
     _style_frag(frag, _donors_from([r for r in removed if isinstance(r, Tag)]))
     if stop is not None:
-        _move_into(frag, insert_before=stop)
+        moved = _move_into(frag, insert_before=stop)
     else:
-        _move_into(frag, parent=target.parent)
+        moved = _move_into(frag, parent=target.parent)
     for r in removed:
         r.extract()
+    record_placement(state, target.parent, moved[0] if moved else None)
     return len(removed)
 
 
@@ -536,15 +775,24 @@ def merge_template(raw_html, cfg):
     notes, warnings, filled = [], [], []
     leftovers, kept, dropped, unwrapped, used_targets = [], [], [], [], []
     section_labels = cfg.get("sectionLabels") or []
+    # Sections are not always placed in the order the doc had them: one that
+    # matches a template heading is filled first, and one with no heading joins
+    # a box afterwards. Each placement is recorded with the position its section
+    # held in the doc, so a later arrival is still slotted into the right spot.
+    state = {"placements": [], "donors": [], "last_box": None,
+             "order": 0, "label": ""}
 
     # ---- 1. Fill each region from its own heading ---------------------------
     pending = []
-    for r in cfg.get("regions") or []:
+    for i, r in enumerate(cfg.get("regions") or []):
         if not r.get("html") and not r.get("text"):
             continue
+        r["__order"] = r["order"] if isinstance(r.get("order"), int) else i
+        state["order"] = r["__order"]
+        state["label"] = r.get("label") or ""
         target = find_label(root, r.get("names") or [])
         if target is not None and not r.get("inline"):
-            count = replace_under(target, r["html"], root, section_labels)
+            count = replace_under(target, r["html"], root, section_labels, state)
             if count >= 0:
                 used_targets.append(target)
                 filled.append(r["key"])
@@ -554,11 +802,26 @@ def merge_template(raw_html, cfg):
         pending.append(r)
 
     # ---- 2. Anything still unfilled: use its [ ... ] placeholder ------------
-    for r in pending:
+    for i, r in enumerate(pending):
+        state["order"] = r["__order"] if isinstance(r.get("__order"), int) else i
+        state["label"] = r.get("label") or ""
         hit = find_bracket(root, r.get("brackets") or [])
         if not hit:
-            warnings.append(f'Nowhere in the template to put the "{r["key"]}" content '
-                            f'(no heading and no matching [ ] placeholder).')
+            # No heading and no [ ] spot of its own. The content still belongs
+            # inside the layout, so it goes into the box the section above it
+            # filled rather than being dropped or tacked on to the end.
+            where = None if r.get("inline") else place_loose(r["html"], root, state,
+                                                             section_labels)
+            if where:
+                filled.append(r["key"])
+                notes.append(
+                    f'The template has no "{r["key"]}" heading, so that content '
+                    + ("went into the same box as the section above it."
+                       if where == "box" else
+                       "went into the placeholder box in the template."))
+            else:
+                warnings.append(f'Nowhere in the template to put the "{r["key"]}" '
+                                f'content (no heading and no matching [ ] placeholder).')
             continue
         if r.get("inline"):
             plain = re.sub(r"<[^>]+>", "", r.get("text") or "").replace("&amp;", "&")
@@ -573,8 +836,10 @@ def merge_template(raw_html, cfg):
             continue
         frag = _wrap(r["html"])
         _style_frag(frag, _donors_from([block]))
-        _move_into(frag, insert_before=block)
+        host = block.parent
+        moved = _move_into(frag, insert_before=block)
         block.extract()
+        record_placement(state, host, moved[0] if moved else None)
         filled.append(r["key"])
         notes.append(f'Placeholder {hit["text"]} replaced with the "{r["key"]}" content.')
 
@@ -582,10 +847,12 @@ def merge_template(raw_html, cfg):
     banner_used = False
     banner = cfg.get("banner")
     if banner and (banner.get("heading") or banner.get("html")):
+        state["order"] = banner["order"] if isinstance(banner.get("order"), int) else 9999
+        state["label"] = banner.get("heading") or ""
         bt = banner_target(root, used_targets, section_labels)
         if bt is not None:
             if banner.get("html"):
-                bn = replace_under(bt, banner["html"], root, section_labels)
+                bn = replace_under(bt, banner["html"], root, section_labels, state)
                 if bn >= 0:
                     notes.append(f"Banner copy replaced ({bn} template block(s)).")
             if banner.get("heading"):
@@ -594,16 +861,30 @@ def merge_template(raw_html, cfg):
             filled.append(banner.get("key") or "Banner")
             banner_used = True
             notes.append(f'Banner heading set to "{banner.get("heading") or ""}".')
-        elif banner.get("fallbackHtml"):
-            frag = _wrap(banner["fallbackHtml"])
-            _move_into(frag, parent=root)
-            filled.append(banner.get("key") or "Banner")
-            warnings.append(f'The banner was already taken, so the '
-                            f'"{banner.get("key") or "banner"}" section was added as a '
-                            f'banner of its own at the end.')
+        elif banner.get("html") or banner.get("fallbackHtml"):
+            # No banner heading was free. Put the content in the layout's own
+            # content box before ever appending a new banner to the bottom of
+            # the page, which is where this used to land.
+            b_where = (place_loose(banner["html"], root, state, section_labels)
+                       if banner.get("html") else None)
+            if b_where:
+                filled.append(banner.get("key") or "Banner")
+                notes.append(f'No banner heading was free, so the '
+                             f'"{banner.get("key") or "banner"}" content went into the '
+                             f'template box, not the bottom of the page.')
+            elif banner.get("fallbackHtml"):
+                frag = _wrap(banner["fallbackHtml"])
+                _move_into(frag, parent=root)
+                filled.append(banner.get("key") or "Banner")
+                warnings.append(f'The banner was already taken, so the '
+                                f'"{banner.get("key") or "banner"}" section was added as '
+                                f'a banner of its own at the end.')
         else:
             warnings.append(f'No banner heading in the template for the '
                             f'"{banner.get("key") or "banner"}" section.')
+
+    # ---- 2c. Put each section's own header back above it --------------------
+    restore_headers(root, state)
 
     # ---- 3. Discussion title -----------------------------------------------
     title_done = False
@@ -734,6 +1015,13 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
     """
     log = []
     sections = sections or {}
+    order_map = sections.get("_order") or {}
+    label_map = sections.get("_labels") or {}
+
+    def _ord(key, default):
+        value = order_map.get(key)
+        return value if isinstance(value, int) else default
+
     prompt = (sections.get("prompt") or "").strip()
     objective = (sections.get("objective") or "").strip()
     instructions = (sections.get("instructions") or "").strip()
@@ -750,6 +1038,8 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
                       "Background", "Case Study"],
             "brackets": ["prompt", "scenario", "overview", "background"],
             "html": prompt,
+            "order": _ord("prompt", 0),
+            "label": label_map.get("prompt", ""),
         })
     if objective:
         regions.append({
@@ -757,6 +1047,8 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
             "names": ["Objective", "Objectives", "Purpose"],
             "brackets": ["objective", "purpose"],
             "html": objective,
+            "order": _ord("objective", 1),
+            "label": label_map.get("objective", ""),
         })
     if instructions:
         names = [n for n in [anchor, "Discussion Instructions", "Instructions",
@@ -767,11 +1059,13 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
             "brackets": ["requirement", "instruction", "question",
                          "insert instructions"],
             "html": instructions,
+            "order": _ord("instructions", 2),
+            "label": label_map.get("instructions", ""),
         })
 
     # Sections the doc names itself: "Response Requirements" routes to the
     # template heading of that name, "[Prompt]" to its [ ... ] spot.
-    for ex in (sections.get("_regions") or []):
+    for _ei, ex in enumerate(sections.get("_regions") or []):
         if not (ex.get("html") or "").strip():
             continue
         regions.append({
@@ -779,11 +1073,19 @@ def compose_body(template_html, content_html, title="", anchor="Instructions",
             "names": [] if ex.get("bracket") else [ex["label"], ex["keyword"]],
             "brackets": [ex["keyword"]],
             "html": ex["html"],
+            "order": ex["order"] if isinstance(ex.get("order"), int) else 3 + _ei,
+            "label": ex.get("display") or ex["label"],
         })
+
+    # Doc order decides where each section ends up in the box, so the list the
+    # merge works through is sorted that way too.
+    regions.sort(key=lambda reg: reg.get("order", 0))
 
     banner_cfg = None
     if banner and ((banner.get("label") or "").strip() or (banner.get("html") or "").strip()):
         banner_cfg = {
+            "order": banner["order"] if isinstance(banner.get("order"), int)
+            else _ord("_banner", -1),
             "key": (banner.get("label") or "Banner").strip(),
             "heading": (banner.get("label") or "").strip(),
             "html": (banner.get("html") or "").strip(),
